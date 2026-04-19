@@ -1,0 +1,1649 @@
+---
+title: "final presentation"
+author: "Jordan Sharples"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+---
+title: "Mx Conversion Improvement - Modeling"
+author: "Whitney Bullock, Sina Odejinmi, and Jordan Sharples" 
+date: "03/23/2026"
+output: 
+  html_document:
+    code_folding: "none"
+    toc: true
+    toc_depth: 4
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      
+  warning = FALSE,   
+  message = FALSE,   
+  error = FALSE,     
+  fig.width = 7,
+  fig.height = 5
+)
+```
+# Modeling MasterControl's MX problem
+## Statement of Business and Analytic Problems
+The challenge MasterControl faces is in its conversion rate for the new Mx product line. Historically, with their well known Qx line, MasterControl has maintained a 19.7% conversion rate on their leads. Mx, however, only has a conversion rate of 12.7%. MasterControl would benefit from a customer profile made up of potential industries, manufacturing models, and contact titles they could use to optimize their outreach efforts. 
+Analytically, this requires us to model the relationships between these key features and the conversion of their past Mx leads. We plan on using various modelling techniques, specifically Logistic Regression, Random Forest, and Gradient Boosted Trees to find these relationships. We also use the text-based latent dirichtlet analysis to find groups into which we can bin free-text field answers. 
+
+
+### Setup
+
+```{r}
+Data <- read.csv("Mastercontrol QAL Performance.csv")
+```
+
+```{r}
+#loading packages and libraries 
+
+packages <- c("tidyverse", "skimr", "DataExplorer", "corrplot", "naniar","caret", "tidymodels","xgboost","randomForest","dplyr","DataExplorer","ggplot2","stringr","forcats","pROC","quanteda","topicmodels","tm","tidytext","quanteda.textstats","wordcloud","RColorBrewer","lubridate","janitor","dplyr","purr","scales")
+install.packages(setdiff(packages, rownames(installed.packages())),repos = "https://cloud.r-project.org")
+
+
+library(tidyverse)
+library(skimr)
+library(DataExplorer)
+library(corrplot)
+library(naniar)
+library(DataExplorer)
+library(ggplot2)
+library(caret)
+library(tidymodels)
+library(xgboost)
+library(randomForest)
+library(dplyr)
+library(stringr)
+
+Data_clean <- Data %>%
+  mutate(across(where(is.character), ~ na_if(str_trim(.), "")))
+
+library(naniar)
+
+miss_var_summary(Data_clean)
+
+Data_clean <- Data_clean %>%
+  mutate(
+    acct.target.industry  = replace_na(acct.target.industry, "Unknown"),
+    acct.territory.rollup = replace_na(acct.territory.rollup, "Unknown"),
+    acct.tier.rollup      = replace_na(acct.tier.rollup, "Unknown"),
+    contact.lead.title    = replace_na(contact.lead.title, "Unknown"),
+    acct.manufacturing.model = replace_na(acct.manufacturing.model, "Unknown"),
+    acct.primary.site.function = replace_na(acct.primary.site.function, "Unknown")
+  )
+
+#Identifying result as other if less than 50 unique variables 
+
+library(forcats)
+
+# Data_model <- Data_clean %>%
+#  mutate(
+#    acct.target.industry  = fct_lump_min(as.factor(acct.target.industry), min = 50),
+#    acct.territory.rollup = fct_lump_min(as.factor(acct.territory.rollup), min = 50),
+#    acct.manufacturing.model = fct_lump_min(as.factor(acct.manufacturing.model), min = 50),
+#    acct.primary.site.function = fct_lump_min(as.factor(acct.primary.site.function), min = 50)
+#  )
+
+#creating a target variable to use for future modeling. Target shows positive movement through the sales funnel.  
+
+Data2 <- Data_model %>%
+  mutate(
+    Target = if_else(
+      next_stage__c %in% c("SQL", "SQO", "WON"),
+      1, 0
+    )
+  )
+
+#feature engineering to make meaningful subgroups for contact lead title that was an open text field and resulted in 6589 different title results.  This buckets the 6589 into 6.   
+
+Data3 <- Data2 %>% mutate(contact.lead.title = case_when( grepl("Manager|Director|Head|Executive|President", contact.lead.title, ignore.case = TRUE) ~ "Management", grepl("Engineer|Developer|Programmer|Scientist|Chemist|Inspector|Technologist|Quality", contact.lead.title, ignore.case = TRUE) ~ "Engineering", grepl("Sales|Account|Business", contact.lead.title, ignore.case = TRUE) ~ "Sales", grepl("Analyst|Consultant", contact.lead.title, ignore.case = TRUE) ~ "Analytics", grepl("Marketing|Communications", contact.lead.title, ignore.case = TRUE) ~ "Marketing", TRUE ~ "Other" ))
+
+#factoring variables 
+cat_vars <- names(Data3)[sapply(Data3, function(x) is.character(x) | is.factor(x))]
+
+#removing unwanted variables 
+cat_vars <- setdiff(cat_vars, 
+                    c("QAL.ID", 
+                      "qal.cohort.date", 
+                      "contact.lead.id",
+                      "next_stage__c"))
+Mx_data <- Data3 %>%
+  filter(solution_rollup == "Mx")
+```
+## Modeling
+
+Our baseline model will start with a logistics regression analysis.  This model is highly interpretable and can directly output a conversion probability between 0 and 1.  With this model we will be able to examine lift from various variable factors, confirming our assumptions with industry and title.  
+
+The second model of choice will be a random forest model because of its ability to handle non-linear relationships.  It can help capture complex patterns in the data to help uncover hidden insights.  
+
+
+Because we have a binary target we are looking to maximize recall for high-quality leads, maintain reasonable precision, produce lift charts so that Master Control sales team can have success in MX conversions.
+### Feature engineering Primary Site Function 
+
+```{r}
+
+#Feature engineer the primary site function to limit it into understandable categories  
+
+Data_clean_Mx_modeling <- Mx_data %>%
+ mutate(site_group = case_when(
+  str_detect(acct.primary.site.function,"injectable|API|biologic|OSD") ~ "Pharma Manufacturing",
+  str_detect(acct.primary.site.function,"device|IVD|surgical") ~ "Device Manufacturing",
+  str_detect(acct.primary.site.function,"Non-manufacturing") ~ "Non-Manufacturing",
+  TRUE ~ "Other Manufacturing"
+ ))
+
+```
+
+We created the site_group variable to combine detailed site function descriptions into broader, more meaningful manufacturing categories. This reduces complexity in the data and ensures similar site functions are analyzed together. Grouping these values also makes the dataset easier to use for modeling and improves interpretability of the results.
+
+
+### Log Model 
+
+```{r}
+
+#model preparation 
+set.seed(123)
+
+train_index <- createDataPartition(Data3$Target, p = .7, list = FALSE)
+train_data <- Data3[train_index, ]
+test_data  <- Data3[-train_index, ]
+
+#log model with weights to try and improve model with target imbalance. 
+
+log_model <- glm(Target ~ acct.target.industry +
+                   acct.territory.rollup +
+                   acct.tier.rollup +
+                   contact.lead.title +
+                   last.tactic.campaign.channel +
+                   acct.manufacturing.model + 
+                   Priority,
+                 data = train_data,
+                 family = "binomial",
+                 weights = ifelse(train_data$Target == 1,3,1))
+
+# keeps log model output clean 
+tidy(log_model) %>%
+  filter(p.value < 0.05) %>%
+  mutate(odds_ratio = exp(estimate)) %>%
+  arrange(desc(abs(estimate)))
+
+# this would show the complete output for the log model 
+#summary(log_model)
+
+```
+
+```{r}
+
+#pulls in log model, provides a pred value if >.5 will identify it as converting.
+pred_probs <- predict(log_model, test_data, type = "response")
+
+pred_class <- ifelse(pred_probs > .5, 1, 0)
+
+#confusion matrix to get accuracy, sensitivity, etc for model analysis 
+confusionMatrix(as.factor(pred_class), as.factor(test_data$Target))
+```
+
+
+```{r}
+#produces area unter the curve graphic to score model performance
+
+# install.packages("pROC")
+library(pROC)
+
+
+roc_obj <- roc(test_data$Target, pred_probs)
+
+
+auc_value <- auc(roc_obj)
+print(auc_value)
+
+plot(roc_obj, col = "#1c61b6", lwd = 3, main = "ROC Curve for Logistic Regression Model")
+abline(a = 0, b = 1, lty = 2, col = "gray")  # diagonal line for reference
+
+
+auc_value <- auc(roc_obj)
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), col = "#1c61b6", lwd = 3)
+```
+
+### Log Model Summary 
+
+The logistic regression model was used as the baseline model to predict lead conversion because it is highly interpretable and produces probabilities between 0 and 1. The model showed solid performance with 79% accuracy and an AUC of 0.822, indicating good ability to distinguish between converting and non-converting leads. Results show that medium and small tier accounts, management-level contacts, and high-intent actions such as “Contact Us,” “Live Demo,” and “Website Pricing” significantly increase the likelihood of conversion. In contrast, leads from Non-Life Science industries and several marketing channels such as email, events, and external demand generation showed lower conversion likelihood. Overall, the logistic model helped identify which variables influence conversion, providing interpretable insights that will guide further analysis with Random Forest to capture complex patterns and rank feature importance.
+
+### Random Forest Model 
+
+We decided to implement a Random Forest Model to our analysis to try to discover non-linear relationships in the data.  We have chosen to build 500 trees to learn from and aggregate our predictions to try to improve prediction accuracy.  Does industry and location truly have impacts on each other for conversion? Lastly, we are trying to determine which features are most important to model on.  Is there one feature over another that will have a stronger influence on conversion?  
+
+
+```{r}
+#data preparation 
+
+set.seed(123)
+
+train_index <- createDataPartition(Data3$Target, p = .7, list = FALSE)
+train_data <- Data3[train_index, ]
+test_data  <- Data3[-train_index, ]
+
+train_data$Target <- as.factor(train_data$Target)
+test_data$Target  <- as.factor(test_data$Target)
+
+#random forest model 
+rf_model <- randomForest(
+  Target ~ acct.target.industry +
+           acct.tier.rollup +
+           acct.territory.rollup +
+           contact.lead.title +
+           last.tactic.campaign.channel +
+           Priority,
+  data = train_data,
+  ntree = 500,
+  importance = TRUE
+)
+```
+
+
+```{r}
+
+#generating predictions to test model performance 
+print(rf_model)
+
+rf_pred_class <- predict(rf_model, test_data)
+
+
+rf_pred_prob <- predict(rf_model, test_data, type = "prob")[,2]
+
+
+#confusion matrix to test sensitivity, accuracy, etc.  
+confusionMatrix(rf_pred_class, test_data$Target)
+
+#area under the curve graphic to score model performance 
+roc_rf <- roc(as.numeric(test_data$Target), rf_pred_prob)
+auc_rf <- auc(roc_rf)
+print(auc_rf)
+
+plot(roc_rf,
+     col = "darkgreen",
+     lwd = 3,
+     main = "ROC Curve for Random Forest Model")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = paste("AUC =", round(auc_rf,3)),
+       col = "darkgreen",
+       lwd = 3)
+
+# Feature Importance
+varImpPlot(rf_model)
+```
+
+
+### Random Forest Summary 
+
+A Random Forest classification model was built using 500 trees and included predictors: industry, account tier, territory, lead title, campaign channel, and priority. The model achieved an accuracy of 83.1% with an AUC of 0.778, indicating good but slightly lower predictive performance than our logistic regression model. Again, the results showed the model to be effective at identifying non-converting leads but still struggled with identifying converting leads due to class imbalance.  Feature importance analysis highlighted which variables contribute most to prediction, helping uncover nonlinear relationships and interaction effects in the data.
+
+### Text mining the job title field
+
+Because MasterControl feels very strongly that job title is an important feature for this analysis, we decided to use some machine learning techniques to topic model the field and bin them using the results. We repeat the Random Forest model with this new feature and use it in a gradient boosted tree model to good effect.
+```{r}
+#factoring variables 
+cat_vars <- names(Data2)[sapply(Data2, function(x) is.character(x) | is.factor(x))]
+
+#removing unwanted variables 
+cat_vars <- setdiff(cat_vars, 
+                    c("QAL.ID", 
+                      "qal.cohort.date", 
+                      "contact.lead.id",
+                      "next_stage__c"))
+Mx_data <- Data2 %>%
+  filter(solution_rollup == "Mx")
+
+# split data into test and train
+set.seed(123)
+
+train_index <- createDataPartition(Mx_data$Target, p = .7, list = FALSE)
+train_data <- Mx_data[train_index,]
+test_data <- Mx_data[-train_index,]
+```
+
+Our first step is to tokenize the free text data field and perform necessary preprocessing to enable our LDA analysis.
+
+```{r}
+library(quanteda)
+library(topicmodels)
+library(tm)
+library(tidytext)
+library(quanteda.textstats)
+
+# Tokenize and preprocess the text data
+tokens <- train_data$contact.lead.title %>%
+    tokens(remove_punct = TRUE, remove_numbers = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(stopwords("en"))
+
+cols <- textstat_collocations(tokens, min_count = 10)
+tokens <- tokens_compound(tokens, pattern = cols)
+
+tokens_test <- test_data$contact.lead.title %>%
+    tokens(remove_punct = TRUE, remove_numbers = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(stopwords("en"))
+
+cols_test <- textstat_collocations(tokens, min_count = 10)
+tokens_test <- tokens_compound(tokens_test, pattern = cols)
+
+
+# Convert tokens to DFM
+dfm_train <- tokens %>%
+  dfm()
+
+dtm_train <- convert(dfm_train, to = "topicmodels")
+
+dfm_test <- tokens_test %>%
+  dfm()
+
+dtm_test <- convert(dfm_test, to = "topicmodels")
+
+```
+
+We will use the perplexity score to determine how many topics we would like to use for this analysis. We ended up going with 12 as it looks like a good local minimum. 
+```{r}
+k_values <- seq(2, 20, by = 1) # check each k value from 2-20
+results <- sapply(k_values, function(k) {
+  model <- LDA(dtm_train, k = k, method = "Gibbs", control = list(iter = 500))
+  perplexity(model, newdata = dtm_test)
+})
+
+plot(k_values, results, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Topics", ylab = "Perplexity",
+     main = "Perplexity Elbow Chart")
+```
+
+#### LDA topic modeling results
+```{r}
+# LDA
+title_lda_train <- LDA(dtm_train, k = 12, control = list(seed = 123))
+
+title_lda_test <- LDA(dtm_test, k = 12, control = list(seed = 123))
+
+# see the top 5 words that constitute each category
+terms(title_lda_train, 7)
+
+# add category column to dataframe
+
+# get category for each document
+title_category_train <- topics(title_lda_train)
+title_category_test <- topics(title_lda_test)
+
+train_data$title.category <- as.factor(topics(title_lda_train))
+
+test_data$title.category <- as.factor(topics(title_lda_test))
+```
+
+We can now see if there is any relationship between the categories identified in the previous step and our target variable
+```{r}
+train_data %>%
+  group_by(title.category) %>%
+  summarise(
+    ConversionRate = mean(Target),
+    Count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ConversionRate)) %>%
+  ggplot(aes(x = reorder(title.category, ConversionRate),
+             y = ConversionRate,
+             fill = ConversionRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Mx Conversion Rate by Identified Title Category",
+       x = "Title Category",
+       y = "Conversion Rate") +
+  scale_fill_gradient(low = "lightblue", high = "steelblue") +
+  theme_minimal() +
+  
+  geom_text(aes(label = Count), hjust = 1.2, color = "black", size = 4)
+
+```
+We clearly see that topic 7 has a very high correlation with the target, they convert at a 21% rate, which is much higher than the standard 12.7%. In order to understand this topic further, we create a word cloud with the top words in this topic.
+
+```{r}
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. Filter the dataset for category 7
+
+subset_titles <- train_data$contact.lead.title[train_data$title.category == 7]
+
+# 2. Create a text corpus
+corpus <- Corpus(VectorSource(subset_titles))
+
+# 3. Clean the text (optional but recommended)
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+
+# 4. Generate the Word Cloud
+# Adjust 'max.words' and 'min.freq' based on your data size
+wordcloud(corpus, 
+          min.freq = 1, 
+          max.words = 100, 
+          random.order = FALSE, 
+          colors = brewer.pal(8, "Dark2"))
+
+```
+```{r}
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. Filter the dataset for category 8
+
+subset_titles <- train_data$contact.lead.title[train_data$title.category == 8]
+
+# 2. Create a text corpus
+corpus <- Corpus(VectorSource(subset_titles))
+
+# 3. Clean the text (optional but recommended)
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+
+# 4. Generate the Word Cloud
+# Adjust 'max.words' and 'min.freq' based on your data size
+wordcloud(corpus, 
+          min.freq = 1, 
+          max.words = 100, 
+          random.order = FALSE, 
+          colors = brewer.pal(8, "Dark2"))
+
+```
+
+```{r}
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. Filter the dataset for category 10
+
+subset_titles <- train_data$contact.lead.title[train_data$title.category == 10]
+
+# 2. Create a text corpus
+corpus <- Corpus(VectorSource(subset_titles))
+
+# 3. Clean the text (optional but recommended)
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+
+# 4. Generate the Word Cloud
+# Adjust 'max.words' and 'min.freq' based on your data size
+wordcloud(corpus, 
+          min.freq = 1, 
+          max.words = 100, 
+          random.order = FALSE, 
+          colors = brewer.pal(8, "Dark2"))
+
+```
+```{r}
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. Filter the dataset for category 6
+
+subset_titles <- train_data$contact.lead.title[train_data$title.category == 6]
+
+# 2. Create a text corpus
+corpus <- Corpus(VectorSource(subset_titles))
+
+# 3. Clean the text (optional but recommended)
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+
+# 4. Generate the Word Cloud
+# Adjust 'max.words' and 'min.freq' based on your data size
+wordcloud(corpus, 
+          min.freq = 1, 
+          max.words = 100, 
+          random.order = FALSE, 
+          colors = brewer.pal(8, "Dark2"))
+
+```
+```{r}
+# Identify top 5 site functions by Target proportion
+top_sites <- train_data %>%
+  group_by(acct.primary.site.function) %>%
+  summarize(prop = mean(Target, na.rm = TRUE)) %>%
+  slice_max(prop, n = 5) %>%
+  pull(acct.primary.site.function)
+
+# Filter dataframe for these top sites
+df_top_sites <- train_data %>% 
+  filter(acct.primary.site.function %in% top_sites)
+
+```
+
+```{r}
+train_data <- train_data %>%
+ mutate(site_group = case_when(
+  str_detect(acct.primary.site.function,"injectable|API|biologic|OSD") ~ "Pharma Manufacturing",
+  str_detect(acct.primary.site.function,"device|IVD|surgical") ~ "Device Manufacturing",
+  str_detect(acct.primary.site.function,"Non-manufacturing") ~ "Non-Manufacturing",
+  TRUE ~ "Other Manufacturing"
+ ))
+
+plot_top_combos <- function(data, second_col, plot_title) {
+  data %>%
+    # 1. Group and calculate both proportion and count
+    group_by(title.category, !!sym(second_col)) %>%
+    summarize(
+      prop = mean(Target, na.rm = TRUE),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    # 2. Filter for combinations with more than 20 occurrences
+    filter(n > 20) %>%
+    # 3. Take the top 5 by performance
+    slice_max(prop, n = 5, with_ties = FALSE) %>%
+    mutate(combo_label = paste(title.category, !!sym(second_col), sep = " + ")) %>%
+    # 4. Plot with count labels
+    ggplot(aes(x = reorder(combo_label, prop), y = prop)) +
+    geom_col(fill = "steelblue") +
+    geom_text(aes(label = paste0("n=", n)), hjust = -0.2, size = 3.5) +
+    coord_flip() +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.2))) + # Adds space for the labels
+    labs(title = plot_title, x = "Top Combinations (n > 20)", y = "Target Proportion") +
+    theme_minimal()
+}
+
+# Run for your specific columns
+p1 <- plot_top_combos(train_data, "site_group", "Top 5: Title + Site Function")
+p2 <- plot_top_combos(train_data, "acct.manufacturing.model", "Top 5: Title + Manufacturing Model")
+p3 <- plot_top_combos(train_data, "acct.target.industry", "Top 5: Title + Industry")
+p4 <- plot_top_combos(train_data, "acct.tier.rollup", "Top 5: Title + Company Size")
+
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+```
+
+```{r LDA continued}
+#factoring variables 
+cat_vars <- names(Data2)[sapply(Data2, function(x) is.character(x) | is.factor(x))]
+
+#removing unwanted variables 
+cat_vars <- setdiff(cat_vars, 
+                    c("QAL.ID", 
+                      "qal.cohort.date", 
+                      "contact.lead.id",
+                      "next_stage__c"))
+Mx_data <- Data2 %>%
+  filter(solution_rollup == "Mx")
+
+Mx_data$function.model.industry.title <- paste(Mx_data$acct.primary.site.function, Mx_data$acct.manufacturing.model, Mx_data$contact.lead.title, Mx_data$acct.target.industry)
+
+
+# split data into test and train
+set.seed(123)
+
+train_index <- createDataPartition(Mx_data$Target, p = .7, list = FALSE)
+train_data <- Mx_data[train_index,]
+test_data <- Mx_data[-train_index,]
+
+```
+
+```{r}
+library(quanteda)
+library(topicmodels)
+library(tm)
+library(tidytext)
+library(quanteda.textstats)
+
+# Tokenize and preprocess the text data
+tokens <- train_data$function.model.industry.title %>%
+    tokens(remove_punct = TRUE, remove_numbers = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(stopwords("en"))
+
+cols <- textstat_collocations(tokens, min_count = 10)
+tokens <- tokens_compound(tokens, pattern = cols)
+
+tokens_test <- test_data$function.model.industry.title %>%
+    tokens(remove_punct = TRUE, remove_numbers = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(stopwords("en"))
+
+cols_test <- textstat_collocations(tokens, min_count = 10)
+tokens_test <- tokens_compound(tokens_test, pattern = cols)
+
+
+# Convert tokens to DFM
+dfm_train <- tokens %>%
+  dfm()
+
+dtm_train <- convert(dfm_train, to = "topicmodels")
+
+dfm_test <- tokens_test %>%
+  dfm()
+
+dtm_test <- convert(dfm_test, to = "topicmodels")
+
+```
+
+```{r}
+k_values <- seq(2, 20, by = 1) # check each k value from 2-20
+results <- sapply(k_values, function(k) {
+  model <- LDA(dtm_train, k = k, method = "Gibbs", control = list(iter = 500))
+  perplexity(model, newdata = dtm_test)
+})
+
+plot(k_values, results, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Topics", ylab = "Perplexity",
+     main = "Perplexity Elbow Chart")
+
+```
+This shows us that the job titles we are looking for are leadership roles within the quality assurance department of the companies we would like to market to.
+
+```{r}
+# LDA
+title_lda_train <- LDA(dtm_train, k = 14, control = list(seed = 123))
+
+title_lda_test <- LDA(dtm_test, k = 14, control = list(seed = 123))
+
+# see the top 5 words that constitute each category
+terms(title_lda_train, 7)
+
+# add category column to dataframe
+
+# get category for each document
+title_category_train <- topics(title_lda_train)
+title_category_test <- topics(title_lda_test)
+
+train_data$title.category <- as.factor(topics(title_lda_train))
+
+test_data$title.category <- as.factor(topics(title_lda_test))
+
+```
+```{r}
+train_data %>%
+  group_by(title.category) %>%
+  summarise(
+    ConversionRate = mean(Target),
+    Count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ConversionRate)) %>%
+  ggplot(aes(x = reorder(title.category, ConversionRate),
+             y = ConversionRate,
+             fill = ConversionRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Mx Conversion Rate by Identified Title Category",
+       x = "Title Category",
+       y = "Conversion Rate") +
+  scale_fill_gradient(low = "lightblue", high = "steelblue") +
+  theme_minimal() +
+  
+  geom_text(aes(label = Count), hjust = -0.2, color = "black", size = 4)
+
+```
+```{r}
+set.seed(1234)
+library(stm)
+processed <- textProcessor(documents = Mx_data$function.model.industry.title, metadata = Mx_data, stem = FALSE)
+out <- prepDocuments(processed$documents, processed$vocab, processed$meta, lower.thresh = 5)
+model <- stm(documents = out$documents, vocab = out$vocab, K = 14, prevalence =~ Mx_data$Target, data = out$Meta)
+```
+```{r}
+prep <- estimateEffect(1:14 ~ Target, stmobj = model, 
+                       metadata = out$meta)
+
+topic_labels <- labelTopics(model, n = 3)$prob
+formatted_labels <- apply(topic_labels, 1, function(x) paste(x, collapse = ", "))
+
+plot(prep, "Target", method = "difference", 
+     cov.value1 = 1, cov.value2 = 0,
+     topics = 1:14, model = model,
+     custom.labels = formatted_labels[1:10])
+```
+```{r}
+cloud(model, topic = 10, max.words = 50, colors = brewer.pal(8, "Dark2"), random.order = FALSE)
+```
+### Modeling with the new feature
+
+```{r}
+clean_train_data_modeling <- train_data %>%
+ mutate(site_group = case_when(
+  str_detect(acct.primary.site.function,"injectable|API|biologic|OSD") ~ "Pharma Manufacturing",
+  str_detect(acct.primary.site.function,"device|IVD|surgical") ~ "Device Manufacturing",
+  str_detect(acct.primary.site.function,"Non-manufacturing") ~ "Non-Manufacturing",
+  TRUE ~ "Other Manufacturing"
+ ))
+clean_test_data_modeling <- test_data %>%
+ mutate(site_group = case_when(
+  str_detect(acct.primary.site.function,"injectable|API|biologic|OSD") ~ "Pharma Manufacturing",
+  str_detect(acct.primary.site.function,"device|IVD|surgical") ~ "Device Manufacturing",
+  str_detect(acct.primary.site.function,"Non-manufacturing") ~ "Non-Manufacturing",
+  TRUE ~ "Other Manufacturing"
+ ))
+
+```
+
+We run a Random Forest model using cross validation for hyperparameter testing
+```{r random_forest}
+cv_control <- trainControl(method = "cv", number = 5, sampling = "down", classProbs = TRUE)
+
+clean_train_data_modeling$Target <- factor(clean_train_data_modeling$Target,
+                            levels = c("0","1"),
+                            labels = c("No","Yes"))
+
+clean_test_data_modeling$Target <- factor(clean_test_data_modeling$Target,
+                            levels = c("0","1"),
+                            labels = c("No","Yes"))
+
+tune_grid <- expand.grid(
+  mtry = c(2,3,4),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1,5,10)
+)
+rf_model <- train(factor(Target) ~ acct.target.industry +
+                    acct.tier.rollup +
+                    acct.territory.rollup +
+                    factor(title.category) +
+                    last.tactic.campaign.channel +
+                    Priority,
+                  data = clean_train_data_modeling,
+                  method = "ranger",
+                  tuneGrid = tune_grid,
+                  trControl = cv_control,
+                  num.trees = 500,
+                  importance = "impurity"
+)
+```
+
+```{r random_forest_model}
+print(rf_model)
+```
+### RF Model performance
+```{r random_forest_performance}
+rf_predictions <- predict(rf_model, test_data)
+
+rf_probs <- predict(rf_model, newdata = clean_test_data_modeling, type = "prob")
+yes_probs <- rf_probs$Yes
+
+confusionMatrix(rf_predictions, factor(clean_test_data_modeling$Target))
+```
+```{r RF_ROC}
+roc_rf <- roc(response = clean_test_data_modeling$Target, predictor = yes_probs)
+auc_rf <- auc(roc_rf)
+print(auc_rf)
+```
+
+```{r RF_AUC_Plot}
+plot(roc_rf,
+     col = "darkgreen",
+     lwd = 3,
+     main = "ROC Curve for Random Forest Model with LDA topics and only MX data")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = paste("AUC =", round(auc_rf,3)),
+       col = "darkgreen",
+       lwd = 3)
+```
+We would also like to look at the feature importance for our RF model
+
+```{r rf_importance}
+imp_scores <- varImp(rf_model)
+
+print(imp_scores)
+
+plot(imp_scores, top = 10, main = "Top 10 most important features")
+```
+Many of these features are things that come from the form that we can't really target in outbound marketing efforts. However, topic 12 was a useful feature, in that if any entry belonged in topic 12, they were much less likely to progress. Looking at the top 20 important features, we also saw that topic 7 showed up as we may have predicted.
+
+### Gradient Boosted Tree with Modeled Topics
+
+We also tried a gradient boosted tree to see if we could get additional performance.
+
+```{r Gradient_boosted_tree_setup}
+# set up cross validation
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down"
+)
+
+# Parameter grid
+xgb_grid <- expand.grid(
+  nrounds = c(100,200,300),
+  max_depth = c(3,6,9),
+  eta = c(0.001, 0.01, 0.1),
+  gamma = 0,
+  colsample_bytree = c(1,0.8),
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+```
+
+```{r, warning=FALSE, message=FALSE, XGB_training}
+xgb_model <- suppressWarnings(train(
+  factor(Target) ~ acct.target.industry +
+                    acct.tier.rollup +
+                    acct.territory.rollup +
+                    factor(title.category) +
+                    last.tactic.campaign.channel +
+                    Priority, 
+  data = clean_train_data_modeling, 
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = xgb_grid,
+  verbosity = 0,
+  metric = "ROC" 
+))
+```
+### Gradient Boost Model Evaluation
+```{r XGB_evaluation}
+xgb_preds <- predict(xgb_model, newdata = clean_test_data_modeling)
+confusionMatrix(xgb_preds, clean_test_data_modeling$Target)
+
+xgb_probs <- predict(xgb_model, newdata = clean_test_data_modeling, type = "prob")
+roc_obj <- roc(clean_test_data_modeling$Target, xgb_probs$Yes)
+
+plot(roc_obj, col = "darkorange", lwd = 3, main = "XGBoost ROC Curve")
+legend("bottomright",
+       legend = paste("AUC = ", round(auc(roc_obj),3)),
+       col = "darkorange",
+       lwd = 3)
+cat("TestAUC:", auc(roc_obj))
+```
+The gradient boosted method performed slightly less well overall, but had a higher specificity, which is interesting to MasterControl, as they do not want to miss potential conversions. 
+
+```{r XGB_Feature_importance}
+xgb_imp <- varImp(xgb_model, scale = FALSE)
+
+print(xgb_imp)
+plot(xgb_imp, top=10)
+```
+
+The feature importance is very similar here.
+
+### Additional modeling analysis
+We wanted to be able to better understand our models and what makes up the highest predicted probability scored entries in our dataset. To this end we performed the following analysis.
+
+```{r addl_setup}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(skimr)
+
+
+# import file   #QAL_Performance_for_MSBA.csv
+#Mastercontrol QAL Performance-2.csv
+qal <- read_csv("Mastercontrol QAL Performance.csv")
+# clean up feature names
+qal <- qal %>% clean_names()
+qal2 <- qal %>%
+  mutate(
+    # Only treat TRUE NA as missing
+    title_missing = if_else(is.na(contact_lead_title), "Missing", "Not Missing"),
+
+    # Binary progression variable (using correct column name)
+    progressed = if_else(next_stage_c %in% c("SQL", "SQO", "Won"), 1, 0)
+  )
+
+# Clean acct_primary_site_function so fake NA values don't appear as categories
+qal_clean <- qal %>%
+  mutate(
+    acct_primary_site_function = as.character(acct_primary_site_function),
+    acct_primary_site_function = str_trim(acct_primary_site_function),
+    acct_primary_site_function = na_if(acct_primary_site_function, "NA"),
+    acct_primary_site_function = na_if(acct_primary_site_function, "N/A"),
+    acct_primary_site_function = na_if(acct_primary_site_function, "na"),
+    acct_primary_site_function = na_if(acct_primary_site_function, ""),
+    acct_primary_site_function = na_if(acct_primary_site_function, " ")
+  )
+
+qal_model <- qal2 %>%
+  #  Exclude the 483 records still in QAL stage (missing next_stage_c)
+  filter(!is.na(next_stage_c))
+
+# creating a set of new date‑based features derived from the existing column qal_cohort_date. Using lubridate
+qal_model2 <- qal_model %>%
+  mutate(
+    cohort_year = year(qal_cohort_date),
+    cohort_month = month(qal_cohort_date),
+    cohort_day = day(qal_cohort_date),
+    cohort_wday = wday(qal_cohort_date, label = TRUE),
+    cohort_week = isoweek(qal_cohort_date),
+    cohort_quarter = quarter(qal_cohort_date),
+    cohort_age_days = as.numeric(Sys.Date() - qal_cohort_date)
+  )
+```
+
+```{r eval=FALSE}
+
+#==========================================================
+# 0. Libraries and seed
+#==========================================================
+library(tidyverse)
+library(tidymodels)
+library(stringr)
+library(lubridate)
+
+set.seed(6813)
+
+#==========================================================
+# 1. Prepare engineered dataset (qal_model2)
+#==========================================================
+data_model <- qal_model2 %>%
+  filter(!is.na(progressed)) %>%
+  mutate(
+    progressed = factor(if_else(progressed == 1, "yes", "no")),
+    manu_group = case_when(
+      acct_manufacturing_model %in% c(
+        "503A","503B","CDMO","CMO","CPO",
+        "Formulation / Fill-Finish",
+        "Original Equipment Manufacturing",
+        "Outsources Manufacturing",
+        "In-House"
+      ) ~ "Manufacturing",
+      TRUE ~ "Non-Manufacturing"
+    ),
+    manu_group = factor(manu_group),
+    title_clean = str_trim(contact_lead_title),
+    title_clean = if_else(is.na(title_clean) | title_clean == "", "Missing", title_clean),
+    title_group = case_when(
+      str_detect(title_clean, regex("director|head|vp|vice president|chief|cxo|cso|cto|ceo|coo|cfo", ignore_case = TRUE)) ~ "Leadership",
+      str_detect(title_clean, regex("manager|mgr|supervisor|lead", ignore_case = TRUE)) ~ "Manager",
+      str_detect(title_clean, regex("engineer|scientist|specialist|analyst|technician", ignore_case = TRUE)) ~ "Technical",
+      str_detect(title_clean, regex("quality|qa|qc|compliance|regulatory", ignore_case = TRUE)) ~ "Quality/Regulatory",
+      title_clean == "Missing" ~ "Missing",
+      TRUE ~ "Other"
+    ),
+    title_group = factor(title_group)
+  )
+
+#==========================================================
+# 2. Train/test split + CV folds
+#==========================================================
+set.seed(6813)
+data_split <- initial_split(data_model, prop = 0.8, strata = progressed)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+set.seed(6813)
+cv_folds <- vfold_cv(train_data, v = 3, strata = progressed)
+
+#==========================================================
+# 3. Recipe (NA handling, leakage removal, encoding)
+#==========================================================
+model_recipe <- recipe(progressed ~ ., data = train_data) %>%
+
+  # 3.1 Remove ID columns
+  update_role(qal_id, contact_lead_id, contact_lead_title, title_clean, new_role = "id") %>%
+  step_rm(qal_id, contact_lead_id, contact_lead_title, title_clean) %>%
+
+  # 3.2 Remove target leakage
+  step_rm(next_stage_c) %>%
+  step_rm(starts_with("next_stage_c")) %>%
+  step_rm(contains("stage")) %>%
+
+  # 3.3 Remove date columns
+  step_rm(all_of(names(train_data)[sapply(train_data, inherits, what = "Date")])) %>%
+
+  # 3.4 Remove future-derived fields
+  step_rm(cohort_age_days) %>%
+  step_rm(starts_with("last_tactic")) %>%
+  step_rm(starts_with("priority_")) %>%
+
+  # 3.5 Factor handling + dummy encoding
+  step_string2factor(all_nominal_predictors(), -all_outcomes()) %>%
+  step_unknown(all_nominal_predictors(), -all_outcomes()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes()) %>%
+
+  # 3.6 Remove zero-variance predictors
+  step_zv(all_predictors())
+
+#==========================================================
+# 4. Model specifications
+#==========================================================
+log_spec <- logistic_reg(
+  mode = "classification",
+  penalty = tune(),
+  mixture = 1
+) %>% set_engine("glmnet")
+
+rf_spec <- rand_forest(
+  mode = "classification",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 200
+) %>% set_engine("ranger", importance = "impurity")
+
+gbm_spec <- boost_tree(
+  mode = "classification",
+  trees = 200,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>% set_engine("xgboost")
+
+#==========================================================
+# 5. Workflows
+#==========================================================
+log_wf <- workflow() %>% add_model(log_spec) %>% add_recipe(model_recipe)
+rf_wf  <- workflow() %>% add_model(rf_spec)  %>% add_recipe(model_recipe)
+gbm_wf <- workflow() %>% add_model(gbm_spec) %>% add_recipe(model_recipe)
+
+#==========================================================
+# 6. Tuning grids
+#==========================================================
+log_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = 10
+)
+
+rf_grid <- grid_random(
+  mtry(range = c(1L, 40L)),
+  min_n(),
+  size = 20
+)
+
+gbm_grid <- grid_random(
+  tree_depth(range = c(2L, 8L)),
+  learn_rate(range = c(-3, -0.5)),
+  loss_reduction(),
+  mtry(range = c(1L, 40L)),
+  min_n(),
+  size = 30
+)
+
+#==========================================================
+# 7. Cross‑validation tuning
+#==========================================================
+set.seed(6813)
+log_res <- tune_grid(log_wf, resamples = cv_folds, grid = log_grid,
+                     metrics = metric_set(roc_auc, accuracy))
+
+set.seed(6813)
+rf_res <- tune_grid(rf_wf, resamples = cv_folds, grid = rf_grid,
+                    metrics = metric_set(roc_auc, accuracy))
+
+set.seed(6813)
+gbm_res <- tune_grid(gbm_wf, resamples = cv_folds, grid = gbm_grid,
+                     metrics = metric_set(roc_auc, accuracy))
+
+log_best <- show_best(log_res, metric = "roc_auc", n = 1)
+rf_best  <- show_best(rf_res,  metric = "roc_auc", n = 1)
+gbm_best <- show_best(gbm_res, metric = "roc_auc", n = 1)
+
+log_best
+rf_best
+gbm_best
+
+#==========================================================
+# 8. Finalize workflow for best model
+#==========================================================
+final_log_wf <- finalize_workflow(log_wf, log_best)
+final_rf_wf  <- finalize_workflow(rf_wf,  rf_best)
+final_gbm_wf <- finalize_workflow(gbm_wf, gbm_best)
+
+#==========================================================
+# 9. Pick globally best model
+#==========================================================
+all_best <- bind_rows(
+  log_best %>% mutate(model = "logit"),
+  rf_best  %>% mutate(model = "rf"),
+  gbm_best %>% mutate(model = "gbm")
+)
+
+best_row <- all_best %>% arrange(desc(mean)) %>% dplyr::slice(1)
+
+if (best_row$model == "logit") {
+  final_wf <- finalize_workflow(log_wf, select_best(log_res, metric = "roc_auc"))
+} else if (best_row$model == "rf") {
+  final_wf <- finalize_workflow(rf_wf, select_best(rf_res, metric = "roc_auc"))
+} else {
+  final_wf <- finalize_workflow(gbm_wf, select_best(gbm_res, metric = "roc_auc"))
+}
+
+#==========================================================
+# 10. Fit final model + evaluate on test set
+#==========================================================
+final_fit <- final_wf %>% fit(data = train_data)
+
+test_prob <- predict(final_fit, new_data = test_data, type = "prob") %>%
+  bind_cols(test_data %>% select(progressed))
+
+test_class <- predict(final_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(progressed))
+
+roc_auc(test_prob, truth = progressed, .pred_yes)
+accuracy(test_class, truth = progressed, estimate = .pred_class)
+
+#==========================================================
+# 11. Score entire dataset + top 10% list
+#==========================================================
+scored_all <- predict(final_fit, new_data = data_model, type = "prob") %>%
+  bind_cols(data_model) %>%
+  rename(p_progress = .pred_yes)
+
+n_total  <- nrow(scored_all)
+cutoff_n <- ceiling(0.10 * n_total)
+
+scored_all <- scored_all %>%
+  arrange(desc(p_progress)) %>%
+  mutate(
+    rank_overall = row_number(),
+    top_10_flag  = if_else(rank_overall <= cutoff_n, 1L, 0L)
+  )
+
+top_10 <- scored_all %>% filter(top_10_flag == 1L)
+
+head(top_10)
+head(top_10, 20)
+
+write_csv(scored_all, "qal_scored_all.csv")
+write_csv(top_10,   "qal_top10pct_leads.csv")
+```
+
+```{r eval=FALSE}
+
+# ============================================================
+# 1. Fit the finalized RF workflow
+# ============================================================
+rf_fit <- final_rf_wf %>%
+  fit(data = train_data)
+
+# ============================================================
+# 2. Predict probabilities on the test set
+# ============================================================
+rf_results <- rf_fit %>%
+  predict(test_data, type = "prob") %>%
+  bind_cols(test_data %>% select(progressed))
+
+# ============================================================
+# 3. # Compute ROC data
+roc_data <- rf_results %>%
+  roc_curve(truth = progressed, .pred_yes)
+
+# Create sorted ROC (monotonic in FPR)
+roc_sorted <- roc_data %>%
+  mutate(FPR = 1 - specificity,
+         TPR = sensitivity) %>%
+  arrange(FPR)
+
+# Plot the sorted ROC curve
+ggplot(roc_sorted, aes(x = FPR, y = TPR)) +
+  geom_line(size = 1.2, color = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted") +
+  labs(
+    title = "Sorted ROC Curve (Monotonic TPR vs FPR)",
+    x = "False Positive Rate (FPR)",
+    y = "True Positive Rate (TPR)"
+  ) +
+  theme_minimal()
+```
+```{r eval=FALSE}
+
+# Logistic Regression
+log_top3_auc <- log_res %>%
+  show_best(metric = "roc_auc", n = 3) %>%
+  select(mean)
+
+# Random Forest
+rf_top3_auc <- rf_res %>%
+  show_best(metric = "roc_auc", n = 3) %>%
+  select(mean)
+
+# GBM / XGBoost
+gbm_top3_auc <- gbm_res %>%
+  show_best(metric = "roc_auc", n = 3) %>%
+  select(mean)
+
+log_top3_auc
+rf_top3_auc
+gbm_top3_auc
+```
+ the average AUC for each model is
+```{r eval=FALSE}
+
+log_top3_mean  <- mean(log_top3_auc$mean)
+rf_top3_mean   <- mean(rf_top3_auc$mean)
+gbm_top3_mean  <- mean(gbm_top3_auc$mean)
+
+log_top3_mean
+rf_top3_mean
+gbm_top3_mean
+```
+
+Plot of the top 10% Distribution by Manufacturing group
+```{r eval=FALSE}
+
+top_10 %>%
+  ggplot(aes(x = manu_group, fill = manu_group)) +
+  geom_bar() +
+  scale_fill_manual(values = c("#1B9E77", "#D95F02")) +
+  labs(
+    title = "Top 10% Distribution by Manufacturing Group",
+    x = "Manufacturing Group",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+Plot of the top 10% distribution by the title group
+```{r eval=FALSE}
+
+top_10 %>%
+  ggplot(aes(x = title_group, fill = title_group)) +
+  geom_bar() +
+  labs(
+    title = "Top 10% Distribution by Title Group",
+    x = "Title Group",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+1. Filter full dataset to only Mx leads
+mx_data <- data_model %>% 
+  filter(solution_rollup == "Mx")
+```{r eval=FALSE}
+
+mx_data <- data_model %>% 
+  filter(solution_rollup == "Mx")
+```
+2. Score all Mx leads using the final model
+```{r eval=FALSE}
+
+mx_scored <- predict(final_fit, mx_data, type = "prob") %>%
+  bind_cols(mx_data)
+mx_scored
+```
+
+3. Rank Mx leads by predicted probability
+
+```{r eval=FALSE}
+
+mx_scored <- mx_scored %>%
+  arrange(desc(.pred_yes)) %>%
+  mutate(rank_mx = row_number())
+mx_scored
+```
+4. Extract the first 10 rows of the top 10% of Mx leads
+
+```{r eval=FALSE}
+
+top_10_mx <- mx_scored %>%
+  dplyr::slice(1:floor(0.10 * n()))
+top_10_mx
+```
+5. Compute the actual conversion rate of this ICP segment
+```{r eval=FALSE}
+
+actual_icp_conversion <- mean(top_10_mx$progressed == "yes")
+actual_icp_conversion
+```
+6. Compare to the baseline Mx conversion rate
+
+```{r eval=FALSE}
+
+baseline_mx_conversion <- mean(mx_data$progressed == "yes")
+baseline_mx_conversion
+```
+```{r eval=FALSE}
+
+uplift <- actual_icp_conversion / baseline_mx_conversion
+uplift
+```
+8. Optional: Visualize the uplift
+```{r eval=FALSE}
+
+library(ggplot2)
+
+df <- tibble(
+  segment = c("Baseline Mx", "Top 10% ICP Mx"),
+  conversion = c(baseline_mx_conversion, actual_icp_conversion)
+)
+
+ggplot(df, aes(x = segment, y = conversion, fill = segment)) +
+  geom_col() +
+  labs(
+    title = "Conversion Rate: Baseline Mx vs ICP Top 10%",
+    y = "Conversion Rate",
+    x = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+The codes and the plot for conversion rate vs every percentile of Mx in the dataset.
+
+
+Step 1 — Filter to Mx and score the
+```{r eval=FALSE}
+
+
+
+mx_scored <- predict(final_fit, mx_data, type = "prob") %>%
+  bind_cols(mx_data) %>%
+  arrange(desc(.pred_yes)) %>%
+  mutate(rank = row_number())
+mx_scored
+```
+ Step 2 — Compute conversion rate at every percentile
+```{r eval=FALSE}
+
+library(dplyr)
+library(purrr)
+
+percentiles <- seq(0.01, 1, by = 0.01)
+
+mx_curve <- map_df(percentiles, function(p) {
+  cutoff <- floor(nrow(mx_scored) * p)
+  
+  tibble(
+    percentile = p * 100,
+    conversion_rate = mean(mx_scored$progressed[1:cutoff] == "yes")
+  )
+})
+percentiles
+mx_curve
+```
+Step 3 — Plot conversion rate vs % of Mx targeted
+```{r eval=FALSE}
+
+library(ggplot2)
+library(scales)
+
+ggplot(mx_curve, aes(x = percentile, y = conversion_rate)) +
+  geom_line(color = "#2C7BB6", size = 1.2) +
+  geom_point(color = "#2C7BB6", size = 1) +
+  scale_x_continuous(
+    breaks = seq(0, 100, by = 25),   # major ticks every 10%
+    minor_breaks = seq(0, 100, by = 5),  # optional: minor ticks every 5%
+    labels = function(x) paste0(x, "%")  # add % sign
+  ) +
+  labs(
+    title = "Conversion Rate vs % of Mx Leads Targeted",
+    x = "% of Mx Leads (ranked by model score)",
+    y = "Conversion Rate"
+  ) +
+  theme_minimal(base_size = 14)
+```
+```{r eval=FALSE}
+
+drop_point <- mx_curve %>%
+  filter(conversion_rate < 1) %>%
+  dplyr::slice(1)
+drop_point
+```
+
+
+
+
+Here’s the template to score any lead.
+```{r eval=FALSE}
+
+new_mx_lead <- tibble(
+  acct_primary_site_function = "Food and beverage",
+  acct_manufacturing_model   = "In-House",
+  acct_target_industry       = "Pharma & BioTech",
+  contact_lead_title         = "QA Manager",
+  qal_id                     = "new_id_001",
+  contact_lead_id            = "new_contact_001",
+  next_stage_c               = "SQL",
+  priority                   = "P1 - Webinar Demo",
+  acct_territory_rollup      = "Americas",
+  acct_tier_rollup           = "Medium",
+  solution                   = "Mx",
+  solution_rollup            = "Mx",
+  last_tactic_campaign_channel = "Online Ads",
+  qal_cohort_date            = as.Date("2025-03-01"),
+  title_missing              = "Not Missing",
+  cohort_year                = 2025,
+  cohort_month               = 3,
+  cohort_day                 = 1,
+  cohort_wday                = "Sat",
+  cohort_week                = 9,
+  cohort_quarter             = 1,
+  cohort_age_days            = 20,
+  manu_group                 = "Manufacturing",
+  title_clean                = "QA Manager",
+  title_group                = "Manager"
+)
+```
+
+
+2. Score the new lead with your final model
+This returns:
+- .pred_no
+- .pred_yes ← your progression probability score
+
+This is the key line:
+```{r eval=FALSE}
+
+predict(final_fit, new_mx_lead, type = "prob")
+```
+ class prediction:
+```{r eval=FALSE}
+
+predict(final_fit, new_mx_lead, type = "class")
+```
+ 
+ 
+ 
+
+
+
+
+1. Extract the ICP segment (top 1% of Mx leads)
+```{r eval=FALSE}
+
+mx_icp <- mx_scored %>%
+  dplyr::slice(1:floor(0.01 * n()))
+mx_icp
+```
+First 10 rows of the top 1%
+```{r eval=FALSE}
+
+mx_scored %>% 
+  arrange(desc(.pred_yes)) %>% 
+  dplyr::slice(1:10)
+```
+
+
+### 2. Summarize the ICP profile
+This is the part that turns the data into a story.
+You want to understand:
+- What industries dominate?
+- What titles dominate?
+- What manufacturing models dominate?
+- What regions dominate?
+- What channels dominate?
+- What seniority levels dominate?
+
+ Industry profile
+
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(acct_target_industry, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+Manufacturing model
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(acct_manufacturing_model, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+Manufacturing group
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(manu_group, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+ Title group (seniority
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(title_group, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+
+Clean title (role)
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(title_clean, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+Territory
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(acct_territory_rollup, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+Channel
+```{r eval=FALSE}
+
+mx_icp %>%
+  count(last_tactic_campaign_channel, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+```
+3. (Optional) Visualize the ICP segment
+1. Manufacturing Group (with % labels)
+```{r eval=FALSE}
+
+p1 <- mx_icp %>%
+  count(manu_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = manu_group, y = pct, fill = manu_group)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(pct, accuracy = 1)),
+            vjust = -0.3, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Manufacturing Group (Percent of ICP)", x = NULL, y = "Percentage") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+p1
+```
+
+2. Title Group (with % labels)
+```{r eval=FALSE}
+
+p2 <- mx_icp %>%
+  count(title_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = title_group, y = pct, fill = title_group)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(pct, accuracy = 1)),
+            vjust = -0.3, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Title Group (Percent of ICP)", x = NULL, y = "Percentage") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1),
+        legend.position = "none")
+p2
+```
+3. Industry (with % labels)
+```{r eval=FALSE}
+
+p3 <- mx_icp %>%
+  count(acct_target_industry) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = acct_target_industry, y = pct, fill = acct_target_industry)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(pct, accuracy = 1)),
+            vjust = -0.3, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Industry (Percent of ICP)", x = NULL, y = "Percentage") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1),
+        legend.position = "none")
+p3
+```
+Extraction for Non life science
+1. Extract the ICP segment (top 1%)
+```{r eval=FALSE}
+
+mx_icp <- mx_scored %>%
+  dplyr::slice(1:floor(0.01 * n()))
+```
+2. Filter the ICP to only Non‑Life Science
+```{r eval=FALSE}
+
+mx_icp_nls <- mx_icp %>%
+  filter(acct_target_industry == "Non-Life Science")
+```
+
+ 3. Inspect the result
+```{r eval=FALSE}
+
+mx_icp_nls
+```
+
+## Analysis Q and A 
+### Level 1 Account Analysis Questions 
+
+Q. Which types of accounts are best prospects for Mx? 
+
+  A. Industries in Medical Devices and Blood & Biologics are more likely to convert to Mx.  
+
+Q. Which manufacturing models are more likely to convert? 
+
+  A. Based on our analysis consumer packaged goods, original equipment manufacturing, and CMO showed good volume as well as higher conversion rates.  In-house manufacturing has really high volume but standard conversion rates to existing value of 12.7%.  
+  
+Q. What site functions are likely to convert? 
+
+  A. We did not explore this in enough detail. Feature engineering of site function will need to take place to showcase conversions in meaningful groups.   
+  
+### Level 2 Title Analysis 
+
+Q. Which job titles convert best with account types? 
+
+  A. We explored this at great length and repeatedly Management and Engineering prove to be the decision makes for our potential customers when exploring Master Control as a solution for their need.  These are the groups of people the Master Control Sales team should be engaging with.  
+  
+### Level 3 Cross-Sell Opportunties 
+Q. Which accounts and titles are good for BOTH Qx and Mx products? 
+
+  A. Based on our analysis for a great opportunity for cross selling would be a customer in the Blood & Biologics space as well as Medical Devices. Because of their heavy regulated nature both their quality management system as well as their manufacturing processes would benefit from the controlled, well documented solutions that Qx and Mx provide.  In these spaces it would be very benefical to the customer to have both required processes maintained in the same software that is able to speak to each other and draw results from.  
+  
+## Conclusion  
+
+Through our analysis re-occuring themes appeared and were supported by the modeling. MasterControl's ideal customer profile are small to medium size companies that are in the Blood & Biologics and Medical Devices industries. Strongest conversion results for Mx appeared in EMEA and America Blood & Biologics, as well Japan Medical Devices.   Key decision makers that MasterControl should get their sales team in front of are Management and Engineering from perspective customers.   
+
+We are confident that focusing on small and medium-sized blood and biologics companies in the Americas and EMEA, along with small and medium-sized medical device companies in Japan, will increase the MX conversion rate to 19%. If we include only those titles that are categorized into Topic 7 identified above, it raises to 21%. This targeted mix of company size, industry, and region has demonstrated higher conversion performance compared to the current average of 12.7%.  This represents a 49% relative lift in conversion rate.  
+
+Reaching a 19% conversion rate for the Mx solution would align closely with the current performance of the Qx established product line, which has consistently delivered strong results over its 20+ year history.
+
+## Executive Summary 
+
+This analysis identifies the key drivers of lead conversion for the Mx product and defines a clear, data-backed Ideal Customer Profile (ICP) to improve targeting and performance. Through exploratory analysis and predictive modeling, we found that conversion is most strongly influenced by industry, company size, territory, and contact lead title.  
+
+The highest-performing segments are small and medium-sized companies in the Blood & Biologics and Medical Device industries, particularly within the Americas, EMEA, and Japan. These segments demonstrate significantly higher conversion rates due to the regulatory complexity of their environments, which increases the need for Mx solutions. Within these accounts, Management and Engineering roles consistently show the strongest likelihood of conversion, indicating they are the primary decision-makers and should be the focus of sales engagement.
+
+Predictive modeling supports these findings. A logistic regression model achieved an AUC of 0.82 and 78% accuracy, demonstrating strong predictive power and clear interpretability. Key positive drivers of conversion include high-intent actions such as “Contact Us,” “Live Demo,” and “Website Pricing” interactions, while lower engagement channels such as email, events, and external demand generation were associated with reduced conversion likelihood. The Random Forest model confirmed these patterns while highlighting additional non-linear relationships between variables, though with slightly lower predictive performance.
+
+Based on these insights, we identified a refined ICP that achieves a conversion rate of 19%, compared to the current overall average of 12.7%, representing a substantial improvement in targeting efficiency. This level of performance aligns closely with the established Qx product line, reinforcing the strength and validity of this approach.
+
+In conclusion, focusing sales and marketing efforts on regulated industries, prioritizing small to medium-sized accounts, targeting decision-makers in management and engineering roles, and emphasizing high-intent engagement channels will significantly increase Mx conversion performance and overall pipeline efficiency.
+
+### Group Membership Contribution
+Whitney performed the initial set of logistic regression and random forest models. She also provided the Conclusion and Executive Summary. Jordan performed the text mining analysis and an unused LR model based on that, the random forest that used it and the XGBoost model. He also compiled all of the code into the final assignment, adding intersticial comments as needed. Sina did the analysis of the top scoring entries to identify trends within the "very likely to progress" bin. 

@@ -1,0 +1,396 @@
+---
+title: "Title_LDA"
+author: "Jordan Sharples"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, warning = FALSE, message = FALSE}
+packages <- c("tidyverse", "skimr", "DataExplorer", "corrplot", "naniar","caret", "tidymodels","xgboost","randomForest")
+install.packages(setdiff(packages, rownames(installed.packages())))
+
+
+library(tidyverse)
+library(skimr)
+library(DataExplorer)
+library(corrplot)
+library(naniar)
+library(DataExplorer)
+library(ggplot2)
+library(caret)
+library(tidymodels)
+library(xgboost)
+library(randomForest)
+
+library(tidyverse)
+library(quanteda)
+library(topicmodels)
+library(tm)
+library(tidytext)
+library(quanteda.textstats)
+
+df <- read.csv("Mastercontrol QAL Performance.csv")
+```
+
+
+```{r}
+library(dplyr)
+library(stringr)
+
+df_clean <- df %>%
+  mutate(across(where(is.character), ~ na_if(str_trim(.), "")))
+
+library(naniar)
+
+miss_var_summary(df_clean)
+
+df_clean <- df_clean %>%
+  mutate(
+    acct.target.industry  = replace_na(acct.target.industry, "Unknown"),
+    acct.territory.rollup = replace_na(acct.territory.rollup, "Unknown"),
+    acct.tier.rollup      = replace_na(acct.tier.rollup, "Unknown"),
+    contact.lead.title    = replace_na(contact.lead.title, "Unknown"),
+    acct.manufacturing.model = replace_na(acct.manufacturing.model, "Unknown"),
+    acct.primary.site.function = replace_na(acct.primary.site.function, "Unknown")
+  )
+
+library(forcats)
+
+df_model <- df_clean %>%
+  mutate(
+    acct.target.industry  = fct_lump_min(as.factor(acct.target.industry), min = 50),
+    acct.territory.rollup = fct_lump_min(as.factor(acct.territory.rollup), min = 50),
+    acct.manufacturing.model = fct_lump_min(as.factor(acct.manufacturing.model), min = 50),
+    acct.primary.site.function = fct_lump_min(as.factor(acct.primary.site.function), min = 50)
+  )
+
+df2 <- df_model %>%
+  mutate(
+    Target = if_else(
+      next_stage__c %in% c("SQL","SQO","WON"),
+      1,0
+    )
+  )
+
+Mx_data <- df2 %>%
+  filter(solution_rollup == "Mx")
+
+# split data into test and train
+set.seed(123)
+
+train_index <- createDataPartition(Mx_data$Target, p = .7, list = FALSE)
+train_data <- Mx_data[train_index,]
+test_data <- Mx_data[-train_index,]
+```
+
+Feature engineering:
+
+Because the "Contact/Lead Title" feature is considered extremely important in this application and because it is a free text field, we will perform
+a latent dirichlet allocation to identify title categories. We will then explore how closely this category feature is tied to our target
+variable.
+
+```{r}
+# Tokenize and preprocess the text data
+tokens <- train_data$contact.lead.title %>%
+    tokens(remove_punct = TRUE, remove_numbers = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(stopwords("en"))
+
+cols <- textstat_collocations(tokens, min_count = 10)
+tokens <- tokens_compound(tokens, pattern = cols)
+
+tokens_test <- test_data$contact.lead.title %>%
+    tokens(remove_punct = TRUE, remove_numbers = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(stopwords("en"))
+
+cols_test <- textstat_collocations(tokens, min_count = 10)
+tokens_test <- tokens_compound(tokens_test, pattern = cols)
+
+
+# Convert tokens to DFM
+dfm_train <- tokens %>%
+  dfm()
+
+dtm_train <- convert(dfm_train, to = "topicmodels")
+
+dfm_test <- tokens_test %>%
+  dfm()
+
+dtm_test <- convert(dfm_test, to = "topicmodels")
+
+# use perplexity to create elbow chart to determine ideal number of topics
+
+k_values <- seq(2, 20, by = 1)
+results <- sapply(k_values, function(k) {
+  model <- LDA(dtm_train, k = k, method = "Gibbs", control = list(iter = 500))
+  perplexity(model, newdata = dtm_test)
+})
+
+plot(k_values, results, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Topics", ylab = "Perplexity",
+     main = "Perplexity Elbow Chart")
+
+```
+
+We will now model these topic using 12 as our k and add the topic membership as a feature to our dataframe
+
+```{r, LDA Modeling}
+# LDA
+title_lda_train <- LDA(dtm_train, k = 12, control = list(seed = 123))
+
+title_lda_test <- LDA(dtm_test, k = 12, control = list(seed = 123))
+
+# see the top 5 words that constitute each category
+terms(title_lda_train, 7)
+
+# add category column to dataframe
+
+# get category for each document
+title_category_train <- topics(title_lda_train)
+title_category_test <- topics(title_lda_test)
+
+train_data$title.category <- as.factor(topics(title_lda_train))
+
+test_data$title.category <- as.factor(topics(title_lda_test))
+```
+
+We can now see if there is any relationship between the categories identified in the previous step and our target variable
+```{r}
+train_data %>%
+  group_by(title.category) %>%
+  summarise(
+    ConversionRate = mean(Target),
+    Count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ConversionRate)) %>%
+  ggplot(aes(x = reorder(title.category, ConversionRate),
+             y = ConversionRate,
+             fill = ConversionRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Mx Conversion Rate by Identified Title Category",
+       x = "Title Category",
+       y = "Conversion Rate") +
+  scale_fill_gradient(low = "lightblue", high = "steelblue") +
+  theme_minimal() +
+  
+  geom_text(aes(label = Count), hjust = -0.2, color = "black", size = 4)
+
+```
+It looks like we have some very strong contenders for categories to target; specifically, category 6 and 7 are significantly higher than the average Mx conversion rate. It looks like the titles we are looking for are in operations management, quality management, manufacturing management, and senior engineers/scientists. Further analysis in the modeling phase will confirm this.
+
+## Modeling using the new feature
+
+We will start with a logisitic regression. This will output a probability of conversion for each of our leads. 
+```{r LR_model_prep}
+clean_train_data_modeling <- train_data %>%
+ mutate(site_group = case_when(
+  str_detect(acct.primary.site.function,"injectable|API|biologic|OSD") ~ "Pharma Manufacturing",
+  str_detect(acct.primary.site.function,"device|IVD|surgical") ~ "Device Manufacturing",
+  str_detect(acct.primary.site.function,"Non-manufacturing") ~ "Non-Manufacturing",
+  TRUE ~ "Other Manufacturing"
+ ))
+clean_test_data_modeling <- test_data %>%
+ mutate(site_group = case_when(
+  str_detect(acct.primary.site.function,"injectable|API|biologic|OSD") ~ "Pharma Manufacturing",
+  str_detect(acct.primary.site.function,"device|IVD|surgical") ~ "Device Manufacturing",
+  str_detect(acct.primary.site.function,"Non-manufacturing") ~ "Non-Manufacturing",
+  TRUE ~ "Other Manufacturing"
+ ))
+```
+
+```{r LR_model}
+LR_model <- glm(Target ~ acct.target.industry +
+                  acct.territory.rollup +
+                  acct.tier.rollup +
+                  factor(title.category) + 
+                  last.tactic.campaign.channel +
+                  acct.manufacturing.model, # +
+                  # Priority,
+                data = clean_train_data_modeling,
+                family = "binomial",
+                weights = ifelse(clean_train_data_modeling$Target == 1,3,1))
+summary(LR_model)
+```
+Let's look at the performance for this log model
+```{r LR_Model_perfromance}
+
+probs <- predict(LR_model, test_data, type = "response")
+
+predicted <- ifelse(probs > .5,1,0)
+
+confusionMatrix(as.factor(predicted), as.factor(test_data$Target))
+```
+
+```{r LR_AUC}
+library(pROC)
+
+roc_obj <- roc(as.numeric(test_data$Target), predicted)
+
+auc_value <- auc(roc_obj)
+print(auc_value)
+```
+
+```{r}
+plot(roc_obj, col = "#1c61b6", lwd = 3, main = "ROC Curve for Logistic Regression Model with LDA categories and focus on MX")
+abline(a = 0, b = 1, lty = 2, col = "gray")  # diagonal line for reference
+
+
+auc_value <- auc(roc_obj)
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), col = "#1c61b6", lwd = 3)
+
+```
+
+## Random Forest Model
+We run a Random Forest model using cross validation for hyperparameter testing
+```{r random_forest}
+cv_control <- trainControl(method = "cv", number = 5, sampling = "down", classProbs = TRUE)
+
+clean_train_data_modeling$Target <- factor(clean_train_data_modeling$Target,
+                            levels = c("0","1"),
+                            labels = c("No","Yes"))
+
+clean_test_data_modeling$Target <- factor(clean_test_data_modeling$Target,
+                            levels = c("0","1"),
+                            labels = c("No","Yes"))
+
+tune_grid <- expand.grid(
+  mtry = c(2,3,4),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1,5,10)
+)
+rf_model <- train(factor(Target) ~ acct.target.industry +
+                    acct.tier.rollup +
+                    acct.territory.rollup +
+                    factor(title.category) +
+                    last.tactic.campaign.channel +
+                    Priority,
+                  data = clean_train_data_modeling,
+                  method = "ranger",
+                  tuneGrid = tune_grid,
+                  trControl = cv_control,
+                  num.trees = 500,
+                  importance = "impurity"
+)
+```
+
+```{r random_forest_model}
+print(rf_model)
+```
+
+```{r random_forest_performance}
+rf_predictions <- predict(rf_model, test_data)
+
+rf_probs <- predict(rf_model, newdata = clean_test_data_modeling, type = "prob")
+yes_probs <- rf_probs$Yes
+
+confusionMatrix(rf_predictions, factor(clean_test_data_modeling$Target))
+```
+
+```{r RF_ROC}
+roc_rf <- roc(response = clean_test_data_modeling$Target, predictor = yes_probs)
+auc_rf <- auc(roc_rf)
+print(auc_rf)
+```
+
+```{r RF_AUC_Plot}
+plot(roc_rf,
+     col = "darkgreen",
+     lwd = 3,
+     main = "ROC Curve for Random Forest Model with LDA topics and only MX data")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = paste("AUC =", round(auc_rf,3)),
+       col = "darkgreen",
+       lwd = 3)
+```
+
+```{r rf_importance}
+imp_scores <- varImp(rf_model)
+
+print(imp_scores)
+
+plot(imp_scores, top = 10, main = "Top 10 most important features")
+```
+
+```{r Gradient_boosted_tree_setup}
+# set up cross validation
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down"
+)
+
+# Parameter grid
+xgb_grid <- expand.grid(
+  nrounds = c(100,200,300),
+  max_depth = c(3,6,9),
+  eta = c(0.001, 0.01, 0.1),
+  gamma = 0,
+  colsample_bytree = c(1,0.8),
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+```
+
+```{r, warning=FALSE, message=FALSE, XGB_training}
+xgb_model <- suppressWarnings(train(
+  factor(Target) ~ acct.target.industry +
+                    acct.tier.rollup +
+                    acct.territory.rollup +
+                    factor(title.category) +
+                    last.tactic.campaign.channel +
+                    Priority, 
+  data = clean_train_data_modeling, 
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = xgb_grid,
+  verbosity = 0,
+  metric = "ROC" 
+))
+```
+
+```{r XGB_evaluation}
+xgb_preds <- predict(xgb_model, newdata = clean_test_data_modeling)
+confusionMatrix(xgb_preds, clean_test_data_modeling$Target)
+
+xgb_probs <- predict(xgb_model, newdata = clean_test_data_modeling, type = "prob")
+roc_obj <- roc(clean_test_data_modeling$Target, xgb_probs$Yes)
+
+plot(roc_obj, col = "darkorange", lwd = 3, main = "XGBoost ROC Curve")
+legend("bottomright",
+       legend = paste("AUC = ", round(auc(roc_obj),3)),
+       col = "darkorange",
+       lwd = 3)
+cat("TestAUC:", auc(roc_obj))
+```
+
+```{r XGB_Feature_importance}
+xgb_imp <- varImp(xgb_model, scale = FALSE)
+
+print(xgb_imp)
+plot(xgb_imp, top=10)
+```
+
+```{r}
+ICP_data <- clean_train_data_modeling %>%
+  filter(
+    acct.target.industry %in% c("Blood & Biologics", "Medical Device"),
+    acct.tier.rollup %in% c("Small", "Medium"),
+    acct.territory.rollup %in% c("Americas", "EMEA", "Japan")
+  )
+ICP_data$Target <- ifelse(ICP_data$Target == "Yes", 1, 0)
+#reporting on conversion rates for ICP and Mx 
+round(mean(ICP_data$Target), 2)
+```
